@@ -89,9 +89,17 @@ class VoucherLoader:
         return out
 
     def _resolve(self, ledger: str) -> Resolved | None:
+        from .lines import standard_gst_account
         res = self.r.get(ledger)
         if res is None:
             self.unresolved.add(ledger)
+            return None
+        # Same GST head as invoices (Output/Input Tax *), so JE/PE tax lines
+        # do not land on parallel Tally-named OUT PUT / * INPUT @ accounts.
+        if res.kind == "account":
+            gst = standard_gst_account(ledger, self.d.abbr)
+            if gst:
+                return Resolved("account", gst)
         return res
 
     def _is_pl_account(self, res: Resolved) -> bool:
@@ -270,7 +278,14 @@ class VoucherLoader:
             if doc is not None:
                 try:
                     res = self.erp.submit_doc("Payment Entry", doc)
-                    return "Payment Entry", _name_of(res)
+                    name = _name_of(res)
+                    narration = _s(payload.get("NARRATION"))[:1000]
+                    if name and narration:
+                        # ERPNext replaces Payment Entry.remarks with generated
+                        # text during submit; restore the authoritative Tally
+                        # narration after posting.
+                        self.erp.restore_payment_remarks(name, narration)
+                    return "Payment Entry", name
                 except ERPNextError:
                     # Payment Entry rejected (e.g. difference amount): never drop
                     # the record -- fall back to an equivalent Journal Entry.

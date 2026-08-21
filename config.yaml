@@ -63,6 +63,10 @@ group_overrides:
   "Cash-in-hand":     { account_type: "Cash" }
   "Cash-in-Hand":     { account_type: "Cash" }
   "Duties & Taxes":   { account_type: "Tax" }
+  # Tally nests GST (input+output) under Current Assets; Output is still a
+  # liability in substance. bs_check uses GroupTree.ledger_root_type to treat
+  # OUT PUT / Output Tax ledgers as Liability so headlines match ERPNext.
+  "GST":              { account_type: "Tax" }
   "Stock-in-hand":    { account_type: "Stock" }
 
 # Tally party group -> ERPNext party kind

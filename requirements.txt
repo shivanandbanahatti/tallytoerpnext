@@ -2,3 +2,7 @@ requests>=2.31
 python-dotenv>=1.0
 PyYAML>=6.0
 PyMySQL>=1.1
+pymupdf>=1.24
+openai>=1.40
+pytesseract
+Pillow

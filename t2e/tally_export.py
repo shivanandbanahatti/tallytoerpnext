@@ -62,7 +62,8 @@ _MASTER_SPECS = [
     ("ledger",     "Ledger",        ["Name", "Parent", "OpeningBalance", "GUID",
                                       "GSTRegistrationType", "PartyGSTIN", "LedgerPhone",
                                       "Email", "LedgerContact", "Address", "PinCode",
-                                      "CountryName", "LedgerStateName", "BillCreditPeriod"]),
+                                      "CountryName", "LedgerStateName", "BillCreditPeriod",
+                                      "IncomeTaxNumber"]),
     ("vouchertype", "VoucherType",  ["Name", "Parent", "GUID"]),
 ]
 
@@ -74,6 +75,7 @@ def extract_masters(client: TallyClient, store: Staging) -> dict[str, int]:
             f"masters_{kind}", ctype, methods=methods, save_as=f"master_{kind}")
         tag = ctype.upper()
         n = 0
+        seen: list[str] = []
         with store.tx():
             for el in root.findall(f".//{tag}"):
                 name = _norm(el.get("NAME") or _text(el, "NAME"))
@@ -84,7 +86,14 @@ def extract_masters(client: TallyClient, store: Staging) -> dict[str, int]:
                 payload["NAME"] = name
                 parent = _norm(_text(el, "PARENT")) or None
                 store.upsert_master(kind, guid, name, parent, payload)
+                seen.append(guid)
                 n += 1
+            _stage_seen_guids(store, seen)
+            store.conn.execute(
+                """DELETE FROM master
+                   WHERE kind=? AND guid NOT IN (SELECT guid FROM _t2e_seen_guid)""",
+                (kind,),
+            )
         results[kind] = n
     return results
 
@@ -93,6 +102,14 @@ def extract_masters(client: TallyClient, store: Staging) -> dict[str, int]:
 # Voucher extraction (month-chunked)
 # ---------------------------------------------------------------------------
 def _month_windows(from_yyyymmdd: str, to_yyyymmdd: str):
+    """Yield (tally_from, tally_to, keep_to) YYYYMMDD windows.
+
+    Tally's Voucher collection mis-applies ``SVTODATE`` unless the day-of-month
+    is ``01`` or ``31``. Ending a month on day 28/29/30 (Feb and all 30-day
+    months) returns only the FROM day's vouchers. Workaround: send
+    ``SVTODATE`` = first of the next month, then keep only vouchers with
+    ``DATE <= keep_to`` (calendar month end, clamped to the extract end).
+    """
     start = dt.datetime.strptime(from_yyyymmdd, "%Y%m%d").date()
     end = dt.datetime.strptime(to_yyyymmdd, "%Y%m%d").date()
     # Clamp absurd upper bound to today to avoid thousands of empty months.
@@ -100,8 +117,14 @@ def _month_windows(from_yyyymmdd: str, to_yyyymmdd: str):
     cur = start.replace(day=1)
     while cur <= end:
         nxt = (cur.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
-        win_end = min(nxt - dt.timedelta(days=1), end)
-        yield cur.strftime("%Y%m%d"), win_end.strftime("%Y%m%d")
+        keep_to = min(nxt - dt.timedelta(days=1), end)
+        # Next-month-01 is a day Tally honors as SVTODATE.
+        tally_to = nxt
+        yield (
+            cur.strftime("%Y%m%d"),
+            tally_to.strftime("%Y%m%d"),
+            keep_to.strftime("%Y%m%d"),
+        )
         cur = nxt
 
 
@@ -128,8 +151,8 @@ def _voucher_total_debit(v: ET.Element) -> float:
 
 
 # Header fields + AllLedgerEntries (which carries amounts, Dr/Cr flag and bill
-# allocations). The Voucher *collection* honours SVFROMDATE/SVTODATE (the Day
-# Book report does not), so we drive extraction with a per-month collection.
+# allocations). Driven by per-month Voucher collections (see ``_month_windows``
+# for the SVTODATE day-01/31 workaround).
 _VCH_FETCH = [
     "Date", "VoucherTypeName", "VoucherNumber", "PartyLedgerName", "PartyName",
     "Narration", "Reference", "ReferenceDate", "GUID", "MasterId", "AlterId",
@@ -144,19 +167,26 @@ def extract_vouchers(client: TallyClient, store: Staging,
     to_d = str(client.to_date) or dt.date.today().strftime("%Y%m%d")
     total = 0
     per_type: dict[str, int] = {}
-    for win_from, win_to in _month_windows(from_d, to_d):
-        client.from_date, client.to_date = win_from, win_to
+    seen: list[str] = []
+    for win_from, tally_to, keep_to in _month_windows(from_d, to_d):
+        client.from_date, client.to_date = win_from, tally_to
         root = client.export_collection(
             f"vch_{win_from}", "Voucher", fetch=_VCH_FETCH,
             dated=True, save_as=f"vch_{win_from[:6]}")
         vch = root.findall(".//VOUCHER")
         if not vch:
-            progress(win_from, win_to, 0)
+            progress(win_from, keep_to, 0)
             continue
+        kept = 0
         with store.tx():
             for idx, v in enumerate(vch):
                 # Skip cancelled/deleted vouchers; keep optional ones flagged.
                 if _text(v, "ISCANCELLED") == "Yes" or _text(v, "ISDELETED") == "Yes":
+                    continue
+                vdate = _text(v, "DATE") or ""
+                # Drop next-month-01 bleed and any out-of-window dump Tally
+                # sometimes returns when SVTODATE is not honored.
+                if vdate < win_from or vdate > keep_to:
                     continue
                 entries = v.findall("ALLLEDGERENTRIES.LIST") + v.findall("LEDGERENTRIES.LIST")
                 guid = _text(v, "GUID")
@@ -166,15 +196,46 @@ def extract_vouchers(client: TallyClient, store: Staging,
                 vtype = _text(v, "VOUCHERTYPENAME") or v.get("VCHTYPE") or "Unknown"
                 vnum = _text(v, "VOUCHERNUMBER")
                 if not guid:
-                    guid = f"{vtype}:{vnum}:{_text(v,'DATE')}:{win_from}:{idx}"
+                    guid = f"{vtype}:{vnum}:{vdate}:{win_from}:{idx}"
                 payload = _elem_to_dict(v)
                 store.upsert_voucher(
                     guid, vtype, vnum,
-                    _parse_voucher_date(_text(v, "DATE")),
+                    _parse_voucher_date(vdate),
                     _text(v, "PARTYLEDGERNAME") or _text(v, "PARTYNAME"),
                     _voucher_total_debit(v), payload)
+                seen.append(guid)
                 per_type[vtype] = per_type.get(vtype, 0) + 1
                 total += 1
-        progress(win_from, win_to, len(vch))
+                kept += 1
+        progress(win_from, keep_to, kept)
+    # Treat a completed extraction as an authoritative snapshot. This removes
+    # vouchers deleted/cancelled in Tally instead of leaving stale staged rows.
+    date_from = dt.datetime.strptime(from_d, "%Y%m%d").date().isoformat()
+    date_to = min(
+        dt.datetime.strptime(to_d, "%Y%m%d").date(), dt.date.today()
+    ).isoformat()
+    with store.tx():
+        _stage_seen_guids(store, seen)
+        store.conn.execute(
+            """DELETE FROM voucher
+               WHERE vdate BETWEEN ? AND ?
+                 AND guid NOT IN (SELECT guid FROM _t2e_seen_guid)""",
+            (date_from, date_to),
+        )
     per_type["_total"] = total
     return per_type
+
+
+def _stage_seen_guids(store: Staging, guids: list[str]) -> None:
+    store.conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _t2e_seen_guid "
+        "(guid TEXT PRIMARY KEY)"
+    )
+    store.conn.execute("DELETE FROM _t2e_seen_guid")
+    store.conn.executemany(
+        # Tally can repeat the same voucher GUID in more than one monthly
+        # collection.  The authoritative snapshot only needs membership, so
+        # duplicate source rows must not abort the final stale-row cleanup.
+        "INSERT OR IGNORE INTO _t2e_seen_guid(guid) VALUES (?)",
+        ((guid,) for guid in guids),
+    )

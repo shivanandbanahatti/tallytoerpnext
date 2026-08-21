@@ -20,6 +20,7 @@ class CompanyDefaults:
     currency: str
     suspense: str                  # fallback account for unresolved ledgers
     root_by_type: dict[str, str]   # root_type -> ERPNext root account name
+    default_warehouse: str = ""    # leaf warehouse for PI update_stock=1
 
 
 def acc_name(account_name: str, abbr: str) -> str:
@@ -57,6 +58,28 @@ class GroupTree:
         prim = self.primary(group)
         spec = self.root_map.get(prim)
         return spec["root_type"] if spec else "Asset"
+
+    def ledger_root_type(self, ledger_name: str, parent: str) -> str:
+        """Root type for a ledger, with GST substance overrides.
+
+        Tally often nests both Input and Output GST under ``GST → Current
+        Assets``. Output GST is economically a liability (and India Compliance
+        posts ``Output Tax *`` under Duties and Taxes). Classify Output /
+        Provision-for-output style ledgers as Liability so BS headlines match
+        ERPNext.
+        """
+        upper = " ".join((ledger_name or "").upper().split())
+        has_comp = any(t in upper for t in ("CGST", "SGST", "UTGST", "IGST"))
+        if has_comp and (
+            "OUT PUT" in upper
+            or upper.startswith("OUTPUT TAX")
+            or (upper.startswith("OUTPUT") and "REFUND" not in upper)
+            or upper.startswith("PROVISION FOR CGST")
+            or upper.startswith("PROVISION FOR SGST")
+            or upper.startswith("PROVISION FOR IGST")
+        ):
+            return "Liability"
+        return self.root_type(parent)
 
     def account_type(self, group: str) -> str:
         # nearest override in ancestry wins, else primary's mapped account_type

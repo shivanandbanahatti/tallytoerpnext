@@ -3,25 +3,19 @@
 Mirrors ``pl_check`` for the balance-sheet (Asset / Liability / Equity) side:
 
   * Headline: root-type totals (Tally per-ledger closing, natural sign) vs
-    ERPNext GL, calling out the two structural reconciling items a GL-faithful
+    ERPNext GL, calling out the structural reconciling items a GL-faithful
     voucher migration leaves behind --
       - Retained earnings: ERPNext keeps the period's net profit in Income/
-        Expense until a Period-Closing voucher is posted, so its books are out of
-        balance by exactly that amount, which Tally already parks on the BS as
-        the "Profit & Loss A/c" line.
+        Expense until a Period-Closing voucher is posted.
       - Capital grouping: ERPNext's CoA files the Capital Account under
-        root_type Liability, whereas Tally reports it as Equity -- so we also
-        show the combined Liability+Equity figure, which should match.
-  * Party control: Tally keeps a ledger per debtor/creditor; ERPNext consolidates
-    them into the Debtors / Creditors control accounts (party as a dimension).
-    A name-by-name diff is therefore meaningless for parties, so we aggregate the
-    Tally Sundry Debtors / Sundry Creditors groups and compare to the ERPNext
-    control totals.
-  * Per-account: every non-party BS ledger's balance, matched case-insensitively;
-    full table -> data/reports/bs_compare.csv.
+        root_type Liability, whereas Tally reports it as Equity.
+      - GST Output: Tally nests OUT PUT under GST→Current Assets; we classify
+        it as Liability (India Compliance / ERPNext Duties and Taxes).
+  * Party control: Sundry Debtors / Creditors aggregates vs Debtors / Creditors.
+  * Per-account: non-party BS ledgers, with GST aliases collapsed onto
+    Output Tax / Input Tax heads; full table -> data/reports/bs_compare.csv.
 
-Balances are cumulative to ``to_date`` (a balance sheet is a point-in-time
-snapshot), so the full-history window is used by default.
+Balances are cumulative to ``to_date`` (ERPNext GL filtered to that as-of date).
 """
 from __future__ import annotations
 
@@ -44,6 +38,49 @@ def _f(s) -> float:
         return 0.0
 
 
+def _gst_canonical(name: str) -> str | None:
+    """Map Tally/ERP GST ledger names onto India Compliance heads for compare."""
+    upper = " ".join((name or "").upper().split())
+    if "RCM" in upper or "REFUND" in upper or "PAYABLE" in upper:
+        return None
+    component = next(
+        (token for token in ("CGST", "SGST", "UTGST", "IGST") if token in upper),
+        None,
+    )
+    if not component:
+        return None
+    if component == "UTGST":
+        component = "SGST"
+    if (
+        "OUT PUT" in upper
+        or upper.startswith("OUTPUT TAX")
+        or (upper.startswith("OUTPUT") and "INPUT" not in upper)
+        or upper.startswith("PROVISION FOR")
+    ):
+        return f"Output Tax {component}"
+    if "INPUT" in upper or "UNCLAIMED" in upper:
+        return f"Input Tax {component}"
+    return None
+
+
+def _merge_gst_aliases(accounts: dict[str, float]) -> dict[str, float]:
+    """Collapse Tally OUT PUT / * INPUT @ / Unclaimed names into Output/Input Tax."""
+    out = dict(accounts)
+    extras: dict[str, float] = {}
+    drop: list[str] = []
+    for name, val in accounts.items():
+        canon = _gst_canonical(name)
+        if not canon or canon == name:
+            continue
+        extras[canon] = extras.get(canon, 0.0) + val
+        drop.append(name)
+    for name in drop:
+        out.pop(name, None)
+    for canon, val in extras.items():
+        out[canon] = out.get(canon, 0.0) + val
+    return out
+
+
 # ---- Tally side ----------------------------------------------------------
 def tally_bs_accounts(client: TallyClient, store: Staging, from_date: str,
                       to_date: str) -> tuple[dict[str, float], dict[str, float],
@@ -64,7 +101,7 @@ def tally_bs_accounts(client: TallyClient, store: Staging, from_date: str,
         if not name:
             continue
         parent = (el.findtext("PARENT") or "").strip()
-        rt = tree.root_type(parent)
+        rt = tree.ledger_root_type(name, parent)
         if rt not in BS_ROOTS:
             continue
         bal = _f(el.findtext("CLOSINGBALANCE"))
@@ -82,40 +119,45 @@ def tally_bs_accounts(client: TallyClient, store: Staging, from_date: str,
 
 
 # ---- ERPNext side --------------------------------------------------------
-def erpnext_bs_accounts(company: str) -> tuple[dict[str, float], dict[str, float],
-                                               dict[str, float], float]:
-    """Per-account BS balances from GL, root-type totals, control-account totals,
-    and the net P&L still sitting unclosed in Income/Expense."""
+def erpnext_bs_accounts(company: str, as_of: str | None = None
+                        ) -> tuple[dict[str, float], dict[str, float],
+                                   dict[str, float], float]:
+    """Per-account BS balances from GL as of ``as_of`` (YYYYMMDD or YYYY-MM-DD)."""
+    if as_of and len(as_of) == 8 and as_of.isdigit():
+        as_of = f"{as_of[0:4]}-{as_of[4:6]}-{as_of[6:8]}"
     p = get_config().db_params
     conn = pymysql.connect(host=p["host"], port=p["port"], user=p["user"],
                            password=p["password"], database=p["database"],
                            connect_timeout=20)
     try:
         cur = conn.cursor()
+        date_clause = " AND g.posting_date <= %s" if as_of else ""
+        params: list = [company]
+        if as_of:
+            params.append(as_of)
         cur.execute(
-            """SELECT a.account_name, a.root_type,
+            f"""SELECT a.account_name, a.root_type,
                       ROUND(SUM(g.debit-g.credit),2)
                FROM `tabGL Entry` g JOIN `tabAccount` a ON g.account=a.name
                WHERE g.company=%s AND g.is_cancelled=0
                  AND a.root_type IN ('Asset','Liability','Equity')
-               GROUP BY a.account_name, a.root_type""", (company,))
+                 {date_clause}
+               GROUP BY a.account_name, a.root_type""", tuple(params))
         accounts, totals, controls = {}, {r: 0.0 for r in BS_ROOTS}, {}
         for acc_nm, rt, net in cur.fetchall():
             net = float(net)
-            # debit-credit: assets stay positive; liabilities/equity flip to +.
             val = net if rt == "Asset" else -net
             nm = " ".join(acc_nm.split())
             accounts[nm] = val
             totals[rt] += val
             if nm in ("Debtors", "Creditors"):
                 controls[nm] = val
-        # Net P&L still in Income/Expense (== the amount the BS is out of balance
-        # by, until a period-closing / retained-earnings entry is posted).
         cur.execute(
-            """SELECT ROUND(SUM(g.debit-g.credit),2)
+            f"""SELECT ROUND(SUM(g.debit-g.credit),2)
                FROM `tabGL Entry` g JOIN `tabAccount` a ON g.account=a.name
                WHERE g.company=%s AND g.is_cancelled=0
-                 AND a.root_type IN ('Income','Expense')""", (company,))
+                 AND a.root_type IN ('Income','Expense')
+                 {date_clause}""", tuple(params))
         unclosed_pl = float(cur.fetchone()[0] or 0.0)
         return accounts, {k: round(v, 2) for k, v in totals.items()}, controls, unclosed_pl
     finally:
@@ -131,14 +173,15 @@ def run(from_date="20000101", to_date="20990101", top=25) -> None:
     print("Fetching Tally balance-sheet ledgers ...")
     t_acc, t_tot, t_party = tally_bs_accounts(client, store, from_date, to_date)
     print("Fetching ERPNext balance sheet from GL ...")
-    e_acc, e_tot, e_ctrl, unclosed = erpnext_bs_accounts(company)
+    e_acc, e_tot, e_ctrl, unclosed = erpnext_bs_accounts(company, as_of=to_date)
+
+    t_acc = _merge_gst_aliases(t_acc)
+    e_acc = _merge_gst_aliases(e_acc)
 
     print("\n================  BALANCE SHEET HEADLINE  ================")
     print(f"{'':26}{'Tally':>18}{'ERPNext':>18}{'Diff':>15}")
     for rt in BS_ROOTS:
         _line(rt, t_tot[rt], e_tot[rt])
-    # ERPNext files Capital under Liabilities; Tally reports it as Equity. The
-    # combined figure is the like-for-like comparison.
     _line("Liability + Equity", t_tot["Liability"] + t_tot["Equity"],
           e_tot["Liability"] + e_tot["Equity"])
     print("\n  Reconciling items (expected for a GL-faithful voucher migration):")
@@ -147,6 +190,8 @@ def run(from_date="20000101", to_date="20990101", top=25) -> None:
     print("    BS as its 'Profit & Loss A/c' line.")
     print("  - Capital Account is root_type Liability in ERPNext's CoA vs Equity in")
     print("    Tally -- compare the combined Liability+Equity row above.")
+    print("  - Tally nests Output GST under GST->Current Assets; BS totals treat")
+    print("    OUT PUT / Output Tax as Liability (India Compliance / ERPNext).")
 
     print("\n================  PARTY CONTROL ACCOUNTS  ================")
     print(f"{'':26}{'Tally':>18}{'ERPNext':>18}{'Diff':>15}")
@@ -157,8 +202,26 @@ def run(from_date="20000101", to_date="20990101", top=25) -> None:
     print("  Note: individual party ledgers appear only in Tally; ERPNext holds"
           "\n        them in the control accounts above with the party as a dimension.")
 
-    # per-account diffs, excluding party ledgers (which never match by name)
+    print("\n================  GST FAMILY (aliased)  ================")
+    print(f"{'':26}{'Tally':>18}{'ERPNext':>18}{'Diff':>15}")
+    for label in (
+        "Output Tax CGST", "Output Tax SGST", "Output Tax IGST",
+        "Input Tax CGST", "Input Tax SGST", "Input Tax IGST",
+    ):
+        _line(label, t_acc.get(label, 0.0), e_acc.get(label, 0.0))
+    t_net = sum(t_acc.get(k, 0.0) for k in (
+        "Input Tax CGST", "Input Tax SGST", "Input Tax IGST")) - sum(
+        t_acc.get(k, 0.0) for k in (
+            "Output Tax CGST", "Output Tax SGST", "Output Tax IGST"))
+    e_net = sum(e_acc.get(k, 0.0) for k in (
+        "Input Tax CGST", "Input Tax SGST", "Input Tax IGST")) - sum(
+        e_acc.get(k, 0.0) for k in (
+            "Output Tax CGST", "Output Tax SGST", "Output Tax IGST"))
+    _line("Net GST (Input-Output)", t_net, e_net)
+
     party_names = _party_ledger_names(store)
+    # Control accounts are compared in the party section; skip name-level rows.
+    party_names.update({"Debtors", "Creditors"})
     t_low = {k.lower(): (k, v) for k, v in t_acc.items()}
     e_low = {k.lower(): (k, v) for k, v in e_acc.items()}
     rows = []

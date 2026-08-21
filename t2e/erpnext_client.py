@@ -181,22 +181,148 @@ class ERPNextClient:
                            json={"doc": json.dumps(doc)})
 
     def insert_and_submit(self, doctype: str, doc: dict) -> Any:
-        """Insert a (possibly prompt-named) doc as a draft, then submit it.
+        """Insert a draft, optionally rename it to a requested name, then submit.
 
-        Needed for doctypes whose autoname is "Prompt" (e.g. Sales Invoice here):
-        frappe.client.submit treats a named doc as pre-existing and fails, so we
-        create the draft via the resource API then submit by name.
+        Sales Invoice on this site uses Prompt autoname, so a ``name`` must be
+        supplied at insert (Tally invoice number). Sites that use naming_series
+        ignore a supplied name and generate one; we then rename the draft to the
+        requested Tally number before submit.
         """
         if self.dry_run:
             return {"_dry_run": True, "doctype": doctype}
         dt = urllib.parse.quote(doctype)
         draft = {k: v for k, v in doc.items() if k != "docstatus"}
+        rounding_override = draft.pop("_tally_rounding_override", None)
+        tally_total_target = draft.pop("_tally_total_target", None)
+        requested_name = str(draft.pop("name", "") or "").strip()
         draft["doctype"] = doctype
+        # Prompt autoname requires name on insert; series autoname ignores it.
+        if requested_name:
+            draft["name"] = requested_name
         res = self._request("POST", f"/api/resource/{dt}", json=draft)
         name = res["data"]["name"]
+        if requested_name and requested_name != name:
+            self._request(
+                "POST", "/api/method/frappe.client.rename_doc",
+                json={
+                    "doctype": doctype,
+                    "old_name": name,
+                    "new_name": requested_name,
+                    "force": 0,
+                    "merge": 0,
+                },
+            )
+            name = requested_name
         nm = urllib.parse.quote(str(name), safe="")
-        self._request("PUT", f"/api/resource/{dt}/{nm}", json={"docstatus": 1})
+        submit_doc = None
+        if rounding_override or tally_total_target is not None:
+            submit_doc = self._request(
+                "GET", f"/api/resource/{dt}/{nm}"
+            )["data"]
+        if tally_total_target is not None and submit_doc is not None:
+            native_total = float(submit_doc.get("rounded_total") or 0)
+            target = float(tally_total_target)
+            # Compare signed totals. Using abs(target) for returns used to force
+            # a positive rounded_total on Credit/Debit Notes and invert party GL.
+            if abs(native_total - target) > 0.50:
+                grand_total = float(submit_doc.get("grand_total") or 0)
+                rounding_override = {
+                    "rounded_total": target,
+                    "rounding_adjustment": target - grand_total,
+                }
+            elif not rounding_override:
+                rounding_override = None
+        if rounding_override:
+            # ERPNext normally recomputes rounded_total from grand_total during
+            # validation. Tally can explicitly round 17,912.40 to 17,913, which
+            # no global nearest-value rounding mode can express. Submit the
+            # complete document with ERPNext's internal consolidation guard so
+            # its native rounded_total/rounding_adjustment fields (and round-off
+            # GL entry) remain authoritative, without adding a tax row.
+            conversion_rate = float(submit_doc.get("conversion_rate") or 1)
+            submit_doc.update({
+                "is_consolidated": 1,
+                "rounded_total": rounding_override["rounded_total"],
+                "rounding_adjustment": rounding_override["rounding_adjustment"],
+                "base_rounded_total": (
+                    rounding_override["rounded_total"] * conversion_rate
+                ),
+                "base_rounding_adjustment": (
+                    rounding_override["rounding_adjustment"] * conversion_rate
+                ),
+            })
+            self._request(
+                "POST", "/api/method/frappe.client.submit",
+                json={"doc": json.dumps(submit_doc)},
+            )
+            if doctype == "Sales Invoice":
+                # is_consolidated is a real Sales Invoice field used only as a
+                # transient calculation guard here. Frappe rejects changing it
+                # through the document API after submission, so restore the
+                # business value directly without touching modified timestamps
+                # or rerunning invoice validation.
+                self._restore_sales_consolidation_flag(name)
+        else:
+            self._request("PUT", f"/api/resource/{dt}/{nm}", json={"docstatus": 1})
         return {"data": {"name": name}}
+
+    def _restore_sales_consolidation_flag(self, name: str) -> None:
+        """Clear the temporary Sales Invoice calculation guard after submit."""
+        import pymysql
+
+        p = get_config().db_params
+        conn = pymysql.connect(
+            host=p["host"], port=p["port"], user=p["user"],
+            password=p["password"], database=p["database"],
+            connect_timeout=20, autocommit=False,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE `tabSales Invoice` SET is_consolidated=0 "
+                    "WHERE name=%s AND docstatus=1",
+                    (name,),
+                )
+                if cur.rowcount != 1:
+                    raise ERPNextError(
+                        f"could not restore is_consolidated for Sales Invoice {name}"
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def restore_payment_remarks(self, name: str, remarks: str) -> None:
+        """Restore source remarks replaced by Payment Entry's submit hook.
+
+        ``remarks`` is not allow-on-submit, while ERPNext always rewrites it
+        during submission. Updating this non-accounting display field directly
+        is the only way to preserve Tally narration without cancelling and
+        reposting the payment; GL and modified timestamps remain untouched.
+        """
+        if self.dry_run:
+            return
+        import pymysql
+
+        p = get_config().db_params
+        conn = pymysql.connect(
+            host=p["host"], port=p["port"], user=p["user"],
+            password=p["password"], database=p["database"],
+            connect_timeout=20, autocommit=False,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE `tabPayment Entry` SET remarks=%s "
+                    "WHERE name=%s AND docstatus=1",
+                    (remarks[:1000], name),
+                )
+                if cur.rowcount != 1:
+                    raise ERPNextError(
+                        f"could not restore remarks for Payment Entry {name}"
+                    )
+            conn.commit()
+        finally:
+            conn.close()
 
     def delete(self, doctype: str, name: str) -> Any:
         dt = urllib.parse.quote(doctype)
@@ -229,6 +355,45 @@ class ERPNextClient:
     def cancel(self, doctype: str, name: str) -> Any:
         return self._write("POST", "/api/method/frappe.client.cancel",
                            json={"doctype": doctype, "name": name})
+
+    def rename(self, doctype: str, old_name: str, new_name: str) -> Any:
+        return self._write(
+            "POST", "/api/method/frappe.client.rename_doc",
+            json={
+                "doctype": doctype, "old_name": old_name,
+                "new_name": new_name, "force": 0, "merge": 0,
+            },
+        )
+
+    def submit_existing(self, doctype: str, name: str) -> Any:
+        dt = urllib.parse.quote(doctype)
+        nm = urllib.parse.quote(str(name), safe="")
+        return self._write("PUT", f"/api/resource/{dt}/{nm}",
+                           json={"docstatus": 1})
+
+    def set_doctype_property(self, doctype: str, property_name: str,
+                             value: str, property_type: str) -> None:
+        """Set a DocType property through Frappe's cache-aware Property Setter."""
+        rows = self.get_list(
+            "Property Setter", fields=["name", "value"],
+            filters=[
+                ["doc_type", "=", doctype],
+                ["doctype_or_field", "=", "DocType"],
+                ["property", "=", property_name],
+            ], limit=1,
+        )
+        values = {
+            "doc_type": doctype,
+            "doctype_or_field": "DocType",
+            "property": property_name,
+            "property_type": property_type,
+            "value": str(value),
+        }
+        if rows:
+            if str(rows[0].get("value")) != str(value):
+                self.update("Property Setter", rows[0]["name"], values)
+        else:
+            self.insert("Property Setter", values)
 
     def ensure_custom_field(self, doctype: str, fieldname: str,
                             label: str | None = None, fieldtype: str = "Data") -> None:

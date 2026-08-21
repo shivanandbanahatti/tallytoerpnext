@@ -18,6 +18,24 @@ IDEMPOTENT_DOCTYPES = [
 ]
 
 
+def _default_warehouse(erp: ERPNextClient, company: str, abbr: str) -> str:
+    """Prefer Stores - <abbr>; else first non-group warehouse for the company."""
+    preferred = acc_name("Stores", abbr)
+    if erp.exists("Warehouse", preferred):
+        return preferred
+    rows = erp.get_list(
+        "Warehouse",
+        fields=["name"],
+        filters=[
+            ["company", "=", company],
+            ["is_group", "=", 0],
+            ["disabled", "=", 0],
+        ],
+        limit=1,
+    )
+    return rows[0]["name"] if rows else preferred
+
+
 def fetch_company_defaults(erp: ERPNextClient) -> CompanyDefaults:
     cfg = get_config()
     cname = cfg.erpnext["company"]
@@ -37,6 +55,7 @@ def fetch_company_defaults(erp: ERPNextClient) -> CompanyDefaults:
         currency=c["default_currency"],
         suspense=acc_name("Tally Migration Suspense", c["abbr"]),
         root_by_type=root_by_type,
+        default_warehouse=_default_warehouse(erp, cname, c["abbr"]),
     )
 
 
@@ -262,14 +281,18 @@ class MasterLoader:
         return self.d.root_by_type.get(root_type) or self.d.root_by_type["Asset"]
 
     def load_ledger_accounts(self) -> int:
+        overrides = get_config().yaml.get("ledger_parent_overrides") or {}
         n = 0
         for r in self.store.masters("ledger"):
             group = r["parent"] or ""
             if self.tree.party_kind(group):
                 continue  # parties handled separately
             name = r["name"]
+            # Optional remaps (e.g. Bank OD ledger that should post under Bank Accounts).
+            group = overrides.get(name, group)
             full = acc_name(name, self.d.abbr)
             root_type = self.tree.root_type(group)
+
             try:
                 if self._account_exists(full):
                     # A Tally *ledger* can collide (case-insensitively) with an
@@ -292,6 +315,21 @@ class MasterLoader:
                         n += 1
                         continue
                     self._mark(r["guid"], "Account", full, "skipped")
+                    # Apply ledger_parent_overrides to already-created accounts.
+                    if r["name"] in overrides and not self.erp.dry_run:
+                        want = self._leaf_parent(group, root_type)
+                        try:
+                            cur = self.erp._request(
+                                "GET",
+                                f"/api/resource/Account/{full.replace(' ', '%20')}",
+                            )["data"]
+                            if cur.get("parent_account") != want:
+                                self.erp.update("Account", full, {
+                                    "parent_account": want,
+                                    "account_type": self.tree.account_type(group) or cur.get("account_type"),
+                                })
+                        except ERPNextError:
+                            pass
                     n += 1
                     continue
                 acct_type = self.tree.account_type(group)
@@ -326,31 +364,44 @@ class MasterLoader:
                 continue
             name = r["name"]
             payload = _json(r["payload"])
+            tax_values = _party_tax_values(payload)
             try:
                 if kind == "Customer":
-                    if not self.erp.find_by_field("Customer", "customer_name", name) \
-                            and not self.erp.exists("Customer", name):
+                    existing = self.erp.find_by_field(
+                        "Customer", "customer_name", name
+                    ) or (name if self.erp.exists("Customer", name) else None)
+                    values = tax_values
+                    if not existing:
                         self.erp.insert("Customer", {
                             "customer_name": name,
                             "customer_type": "Company",
                             "customer_group": self.customer_group,
                             "territory": self.territory,
-                            "gstin": payload.get("PARTYGSTIN", "") or "",
+                            **values,
                             self.field: r["guid"],
                         })
-                    self._mark(r["guid"], "Customer", name)
+                        existing = name
+                    elif not self.erp.dry_run:
+                        self.erp.update("Customer", existing, values)
+                    self._mark(r["guid"], "Customer", existing)
                     nc += 1
                 else:
-                    if not self.erp.find_by_field("Supplier", "supplier_name", name) \
-                            and not self.erp.exists("Supplier", name):
+                    existing = self.erp.find_by_field(
+                        "Supplier", "supplier_name", name
+                    ) or (name if self.erp.exists("Supplier", name) else None)
+                    values = tax_values
+                    if not existing:
                         self.erp.insert("Supplier", {
                             "supplier_name": name,
                             "supplier_type": "Company",
                             "supplier_group": self.supplier_group,
-                            "gstin": payload.get("PARTYGSTIN", "") or "",
+                            **values,
                             self.field: r["guid"],
                         })
-                    self._mark(r["guid"], "Supplier", name)
+                        existing = name
+                    elif not self.erp.dry_run:
+                        self.erp.update("Supplier", existing, values)
+                    self._mark(r["guid"], "Supplier", existing)
                     ns += 1
             except ERPNextError as exc:
                 self._mark(r["guid"], kind, "", "error", str(exc)[:500])
@@ -397,9 +448,17 @@ class MasterLoader:
                         "item_name": name[:140],
                         "item_group": "All Item Groups",
                         "stock_uom": _json(r["payload"]).get("BASEUNITS") or "Nos",
-                        "is_stock_item": 0,
+                        "is_stock_item": 1,
+                        "is_purchase_item": 1,
+                        "is_sales_item": 1,
                         self.field: r["guid"],
                     })
+                else:
+                    # Promote legacy non-stock migration items so PI update_stock works
+                    try:
+                        self.erp.update("Item", name, {"is_stock_item": 1})
+                    except ERPNextError:
+                        pass
                 self._mark(r["guid"], "Item", name)
                 n += 1
             except ERPNextError as exc:
@@ -414,3 +473,35 @@ def _json(s: str) -> dict:
         return json.loads(s)
     except Exception:
         return {}
+
+
+def _gst_category(value: str | None) -> str:
+    raw = " ".join(str(value or "").split()).lower()
+    if "composition" in raw:
+        return "Registered Composition"
+    if "regular" in raw or "registered" in raw:
+        return "Registered Regular"
+    if "consumer" in raw:
+        return "Consumer"
+    if "overseas" in raw:
+        return "Overseas"
+    if "special economic" in raw or raw == "sez":
+        return "SEZ"
+    return "Unregistered"
+
+
+def _party_tax_values(payload: dict) -> dict[str, str]:
+    """Map Tally party tax identifiers to ERPNext's Tax-tab fields.
+
+    Tally does not always expose IncomeTaxNumber even when GSTIN is present;
+    in that case the embedded PAN (characters 3-12) is authoritative.
+    """
+    gstin = str(payload.get("PARTYGSTIN") or "").strip().upper()
+    pan = str(payload.get("INCOMETAXNUMBER") or "").strip().upper()
+    if not pan and len(gstin) == 15:
+        pan = gstin[2:12]
+    return {
+        "gstin": gstin,
+        "pan": pan,
+        "gst_category": _gst_category(payload.get("GSTREGISTRATIONTYPE")),
+    }

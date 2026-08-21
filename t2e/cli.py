@@ -50,6 +50,12 @@ def _masters(erp: ERPNextClient, s: Staging):
         print("  company GST address:",
               ensure_company_address(erp, get_config().erpnext["company"], dry_run=False))
     defaults = fetch_company_defaults(erp)
+    from .gst_setup import ensure_gst_setup
+    gst_setup = ensure_gst_setup(erp, defaults)
+    print("  GST setup:", {
+        status: sum(1 for value in gst_setup.values() if value == status)
+        for status in sorted(set(gst_setup.values()))
+    })
     ml = MasterLoader(erp, s, defaults)
     ml.ensure_suspense()
     print("  UOMs:", ml.load_uoms())
@@ -77,6 +83,8 @@ def cmd_load_invoices(args) -> int:
     erp, s = ERPNextClient(dry_run=not args.confirm), Staging()
     _banner(erp.dry_run)
     defaults = fetch_company_defaults(erp)
+    from .gst_setup import ensure_gst_setup
+    ensure_gst_setup(erp, defaults)
     if not erp.dry_run:
         ensure_generic_item(erp)
     resolver = LedgerResolver(s, defaults)
@@ -85,10 +93,35 @@ def cmd_load_invoices(args) -> int:
     def prog(i, total, stats):
         print(f"  {i}/{total}  loaded={stats['loaded']} fallback={stats['fallback']} "
               f"error={stats['error']}")
-    print("  invoices:", il.run(vtype=args.type, limit=args.limit, progress=prog))
+    if not erp.dry_run:
+        erp.set_doctype_property("Sales Invoice", "allow_rename", "1", "Check")
+    try:
+        print("  invoices:", il.run(
+            vtype=args.type, limit=args.limit, latest=args.latest, progress=prog
+        ))
+    finally:
+        if not erp.dry_run:
+            erp.set_doctype_property("Sales Invoice", "allow_rename", "0", "Check")
     print(f"  ({len(il.fallback)} vouchers fall back to Journal Entry)")
     s.close()
     return 0
+
+
+def cmd_preflight_invoices(args) -> int:
+    import json
+    from .load_invoices import InvoiceLoader
+    from .load_masters import fetch_company_defaults
+    from .mapping import LedgerResolver
+    erp, s = ERPNextClient(dry_run=True), Staging()
+    _banner(True)
+    defaults = fetch_company_defaults(erp)
+    report = InvoiceLoader(
+        erp, s, defaults, LedgerResolver(s, defaults)
+    ).preflight()
+    print(json.dumps(report, indent=2))
+    s.close()
+    stats = report["stats"]
+    return 1 if stats["rounding_mismatch"] or stats["sales_name_duplicates"] else 0
 
 
 def cmd_load_vouchers(args) -> int:
@@ -241,6 +274,125 @@ def cmd_bs_check(args) -> int:
     return 0
 
 
+def cmd_pi_remaster_staging(args) -> int:
+    from . import pi_remaster as pr
+    _banner(dry_run=True)
+    path = pr.write_pilot_staging()
+    rows = __import__("json").loads(path.read_text(encoding="utf-8"))
+    print(f"  wrote {path} ({len(rows)} rows)")
+    print(f"  csv:   {pr.STAGING_CSV}")
+    for r in rows:
+        ok = "lines_ok" if r.get("lines_ok") else "LINES_BAD"
+        print(f"  - {r.get('erp_pi_name')}  {r.get('erp_bill_no')}  "
+              f"{r.get('match_status')}  {ok}  "
+              f"sum={r.get('lines_sum')} net={r.get('erp_net_total')}")
+    return 0
+
+
+def cmd_pi_remaster_extract(args) -> int:
+    from . import pi_remaster as pr
+    _banner(dry_run=True)
+    pr.extract_migration(force=args.force, limit_pages=args.limit_pages or 0)
+    return 0
+
+
+def cmd_pi_remaster_extract_vision(args) -> int:
+    """GPT-4o vision extract: one page (trial) or --needed batch into staging."""
+    from . import pi_vision as pv
+    import json
+    _banner(dry_run=True)
+    if args.needed:
+        stats = pv.extract_vision_needed(
+            model=args.model,
+            force=not args.cache,
+            limit=args.limit or 0,
+            all_unmatched=args.all_unmatched,
+        )
+        print(f"  vision batch: {stats}")
+        print("  next: python -m t2e --env dev pi-remaster match")
+        return 0 if stats.get("failed", 0) == 0 else 1
+    if args.for_pis:
+        stats = pv.extract_vision_for_pis(
+            model=args.model,
+            force=not args.cache,
+            limit=args.limit or 0,
+            top_k=args.top_k or 1,
+        )
+        print(f"  pi-driven vision: {stats}")
+        print("  next: python -m t2e --env dev pi-remaster match")
+        return 0 if stats.get("failed", 0) == 0 else 1
+
+    path = pv.trial_one_page(
+        pdf_name=args.pdf,
+        page=args.page,
+        model=args.model,
+        force=not args.cache,
+    )
+    result = json.loads(path.read_text(encoding="utf-8"))
+    print(f"  wrote {path}")
+    print(f"  bill_no:     {result.get('ocr_bill_no')}")
+    print(f"  supplier:    {result.get('ocr_supplier')}")
+    print(f"  date:        {result.get('ocr_date')}")
+    print(f"  grand_total: {result.get('ocr_grand_total')}")
+    print(f"  net_total:   {result.get('ocr_net_total')}")
+    print(f"  lines:       {len(result.get('ocr_lines') or [])}  "
+          f"sum={result.get('lines_sum')}")
+    for i, ln in enumerate(result.get("ocr_lines") or [], 1):
+        print(f"    {i}. {ln.get('item_name')}  "
+              f"qty={ln.get('qty')} {ln.get('uom')} @ {ln.get('rate')} "
+              f"= {ln.get('amount')}  HSN={ln.get('gst_hsn_code')}")
+    if result.get("notes"):
+        print(f"  notes: {result['notes']}")
+    usage = result.get("usage") or {}
+    if usage.get("prompt_tokens"):
+        print(f"  tokens: prompt={usage.get('prompt_tokens')} "
+              f"completion={usage.get('completion_tokens')}")
+    return 0
+
+
+def cmd_pi_remaster_match(args) -> int:
+    from . import pi_remaster as pr
+    _banner(dry_run=True)
+    pr.match_staging()
+    return 0
+
+
+def cmd_pi_remaster_apply(args) -> int:
+    from . import pi_remaster as pr
+    _banner(dry_run=not args.confirm)
+    results = pr.apply_pilot(
+        confirm=args.confirm, limit=args.limit or 0, names=args.name,
+        use_batch=not args.pilot,
+    )
+    ok_n = sum(1 for r in results if r.get("ok"))
+    print(f"  done: {ok_n}/{len(results)} ok")
+    return 0 if not results or ok_n == len(results) else 1
+
+
+def cmd_pi_remaster_export_extract(args) -> int:
+    """Write durable page/line CSVs + JSON bundle for remigration without re-OCR."""
+    from . import pi_remaster as pr
+    _banner(dry_run=True)
+    stats = pr.export_extract_csvs()
+    print(f"  pages: {stats['pages_csv']}")
+    print(f"  lines: {stats['lines_csv']}")
+    print(f"  bundle: {stats['bundle_json']}")
+    return 0
+
+
+def cmd_pi_remaster_verify(args) -> int:
+    from . import pi_remaster as pr
+    import json
+    _banner(dry_run=True)
+    rows = pr.verify_pilot(names=args.name)
+    print(json.dumps(rows, indent=2, default=str))
+    ok_rows = [r for r in rows if r.get("pi") and not r.get("error")]
+    bad = [r for r in ok_rows if r.get("has_generic_item")]
+    if not ok_rows and any(r.get("error") for r in rows):
+        return 1
+    return 1 if bad else 0
+
+
 def cmd_run_all(args) -> int:
     from .load_invoices import InvoiceLoader, ensure_generic_item
     from .load_masters import fetch_company_defaults
@@ -269,7 +421,13 @@ def cmd_run_all(args) -> int:
 
     def iprog(i, total, st):
         print(f"  {i}/{total}  loaded={st['loaded']} fallback={st['fallback']} error={st['error']}")
-    print("  invoices:", il.run(progress=iprog))
+    if not erp.dry_run:
+        erp.set_doctype_property("Sales Invoice", "allow_rename", "1", "Check")
+    try:
+        print("  invoices:", il.run(progress=iprog))
+    finally:
+        if not erp.dry_run:
+            erp.set_doctype_property("Sales Invoice", "allow_rename", "0", "Check")
 
     print("\n[4/5] Load payments / journals (linked to invoices)")
     resolver = LedgerResolver(s, defaults)  # refresh after invoices/bill index
@@ -313,9 +471,18 @@ def main(argv=None) -> int:
         lv.add_argument("--confirm", action="store_true")
         lv.add_argument("--type", default=None, help="only this Tally voucher type")
         lv.add_argument("--limit", type=int, default=0)
+        if nm == "load-invoices":
+            lv.add_argument(
+                "--latest", action="store_true",
+                help="with --limit, load the newest invoices instead of the oldest",
+            )
         lv.set_defaults(func=fn)
 
     sub.add_parser("reconcile").set_defaults(func=cmd_reconcile)
+    sub.add_parser(
+        "preflight-invoices",
+        help="validate all staged invoice names, rounding, tax and OCR mappings",
+    ).set_defaults(func=cmd_preflight_invoices)
 
     rp = sub.add_parser("reconcile-payments",
                         help="net unallocated payments/advances against outstanding "
@@ -349,6 +516,94 @@ def main(argv=None) -> int:
     bc.add_argument("--from-date", default=None, help="yyyymmdd")
     bc.add_argument("--to-date", default=None, help="yyyymmdd")
     bc.set_defaults(func=cmd_bs_check)
+
+    pr = sub.add_parser(
+        "pi-remaster",
+        help="replace Tally Migration Item lines on Purchase Invoices with real items",
+    )
+    pr_sub = pr.add_subparsers(dest="pi_cmd", required=True)
+
+    pr_st = pr_sub.add_parser(
+        "staging", help="write pilot staging JSON/CSV from seed + DEV DB match"
+    )
+    pr_st.set_defaults(func=cmd_pi_remaster_staging)
+
+    pr_ex = pr_sub.add_parser(
+        "extract", help="OCR all Migration *Purchase*.pdf pages into staging"
+    )
+    pr_ex.add_argument("--force", action="store_true", help="re-OCR ignoring cache")
+    pr_ex.add_argument("--limit-pages", type=int, default=0,
+                       help="stop after N pages (debug)")
+    pr_ex.set_defaults(func=cmd_pi_remaster_extract)
+
+    pr_xv = pr_sub.add_parser(
+        "extract-vision",
+        help="GPT-4o vision extract (one page, or --needed batch into staging)",
+    )
+    pr_xv.add_argument(
+        "--pdf", default="April 2026_Purchase Invoices_1.pdf",
+        help="filename under data/Migration/ (single-page mode)",
+    )
+    pr_xv.add_argument("--page", type=int, default=1, help="1-based page (single-page mode)")
+    pr_xv.add_argument("--model", default="gpt-4o", help="OpenAI vision model")
+    pr_xv.add_argument(
+        "--cache", action="store_true",
+        help="reuse cached vision JSON if present (default: always call API)",
+    )
+    pr_xv.add_argument(
+        "--needed", action="store_true",
+        help="batch: re-extract unmatched/high-without-lines pages near DEV totals",
+    )
+    pr_xv.add_argument(
+        "--all-unmatched", action="store_true",
+        help="with --needed, send EVERY unmatched staging page to OpenAI",
+    )
+    pr_xv.add_argument(
+        "--for-pis", action="store_true",
+        help="PI-driven: locate best page per still-generic PI, extract with ERPNext hints",
+    )
+    pr_xv.add_argument(
+        "--top-k", type=int, default=1,
+        help="with --for-pis, max pages to try per PI (default 1)",
+    )
+    pr_xv.add_argument(
+        "--limit", type=int, default=0,
+        help="with --needed/--for-pis, max PIs or pages to send to OpenAI",
+    )
+    pr_xv.set_defaults(func=cmd_pi_remaster_extract_vision)
+
+    pr_mt = pr_sub.add_parser(
+        "match", help="match OCR staging pages to DEV Apr–Jun Purchase Invoices"
+    )
+    pr_mt.set_defaults(func=cmd_pi_remaster_match)
+
+    pr_ap = pr_sub.add_parser(
+        "apply", help="recreate PIs with real items (dry-run unless --confirm)"
+    )
+    pr_ap.add_argument("--confirm", action="store_true", help="execute writes")
+    pr_ap.add_argument("--limit", type=int, default=0, help="max staging rows")
+    pr_ap.add_argument(
+        "--name", action="append", default=None,
+        help="only this ERPNext PI name (repeatable)",
+    )
+    pr_ap.add_argument(
+        "--pilot", action="store_true",
+        help="use pilot staging JSON instead of batch OCR staging",
+    )
+    pr_ap.set_defaults(func=cmd_pi_remaster_apply)
+
+    pr_vf = pr_sub.add_parser("verify", help="verify last apply log against DEV DB")
+    pr_vf.add_argument(
+        "--name", action="append", default=None,
+        help="only this PI name (repeatable)",
+    )
+    pr_vf.set_defaults(func=cmd_pi_remaster_verify)
+
+    pr_exout = pr_sub.add_parser(
+        "export-extract",
+        help="export durable page/line CSVs + JSON bundle (no re-OCR needed later)",
+    )
+    pr_exout.set_defaults(func=cmd_pi_remaster_export_extract)
 
     args = p.parse_args(argv)
     from .config import set_environment
